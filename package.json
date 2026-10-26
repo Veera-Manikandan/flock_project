@@ -1,0 +1,23 @@
+{
+  "name": "flock-urja-meter-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A documented read-only API adapter for the Urja Meter Ops portal",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "discover": "node scripts/discover-portal.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "morgan": "^1.10.0",
+    "playwright": "^1.50.0",
+    "zod": "^3.24.1"
+  }
+}
