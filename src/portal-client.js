@@ -1,4 +1,3 @@
-
 import { chromium } from "playwright";
 import { AppError } from "./errors.js";
 
@@ -18,7 +17,6 @@ const asNumber = (value) => {
 const normalizeDate = (value) => {
   if (!value) return null;
 
-  // Portal timestamps may look like "23/06/2026 23:30".
   const match = String(value).match(
     /^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?$/
   );
@@ -37,10 +35,6 @@ const getDateOnly = (value) => {
   return normalized ? normalized.slice(0, 10) : null;
 };
 
-/**
- * Decode the common SvelteKit data-array reference format.
- * If the portal returns ordinary JSON, the original payload is retained.
- */
 function decodeSvelteKitPayload(payload) {
   if (!payload || !Array.isArray(payload.nodes)) {
     return payload;
@@ -88,8 +82,6 @@ function decodeSvelteKitPayload(payload) {
       return result;
     }
 
-    // SvelteKit payloads vary by version. Retain the raw node if the
-    // first entry is not a reference map.
     const first = values[0];
 
     if (!first || typeof first !== "object" || Array.isArray(first)) {
@@ -138,6 +130,7 @@ function unwrapRows(payload) {
   }
 
   if (Array.isArray(payload?.data)) return payload.data;
+
   if (Array.isArray(payload?.decodedNodes)) {
     for (const node of payload.decodedNodes) {
       const rows = unwrapRows(node?.decodedData);
@@ -148,8 +141,9 @@ function unwrapRows(payload) {
   const objects = collectObjects(payload);
 
   const candidate = objects.find((object) =>
-    ["meterId", "meter_id", "serialNumber", "serialNo", "meterNo"]
-      .some((key) => object[key] !== undefined)
+    ["meterId", "meter_id", "serialNumber", "serialNo", "meterNo"].some(
+      (key) => object[key] !== undefined
+    )
   );
 
   return candidate ? [candidate] : [];
@@ -200,7 +194,7 @@ export class PortalClient {
   }
 
   async connect() {
-    if (this.ready) return;
+    if (this.ready && this.page) return;
 
     if (this.connecting) {
       return this.connecting;
@@ -236,41 +230,81 @@ export class PortalClient {
 
       const userSelector =
         process.env.PORTAL_USERNAME_SELECTOR || 'input[type="email"]';
+
       const passSelector =
         process.env.PORTAL_PASSWORD_SELECTOR || 'input[type="password"]';
+
       const submitSelector =
         process.env.PORTAL_SUBMIT_SELECTOR || 'button[type="submit"]';
 
       const userField = this.page.locator(userSelector).first();
       const passField = this.page.locator(passSelector).first();
 
-      if (await userField.count() && await passField.count()) {
+      const userCount = await userField.count();
+      const passCount = await passField.count();
+
+      if (userCount > 0 && passCount > 0) {
         await userField.fill(this.username);
         await passField.fill(this.password);
 
-        await this.page.locator(submitSelector).first().click();
-        await this.page.waitForLoadState("domcontentloaded").catch(() => {});
+        const submitButton = this.page.locator(submitSelector).first();
+
+        if (!(await submitButton.count())) {
+          throw new AppError(
+            502,
+            "PORTAL_LOGIN_SELECTOR_NOT_FOUND",
+            "Portal login fields were found, but the submit button was not. Configure PORTAL_SUBMIT_SELECTOR."
+          );
+        }
+
+        await submitButton.click();
+
+        await this.page
+          .waitForLoadState("domcontentloaded")
+          .catch(() => {});
 
         const successSelector = process.env.PORTAL_LOGIN_SUCCESS_SELECTOR;
 
         if (successSelector) {
           await this.page.locator(successSelector).waitFor({
             state: "visible",
-            timeout: 10000,
+            timeout: 15000,
           });
         } else {
-          // Allow client-side login redirects to settle.
-          await this.page.waitForTimeout(1000);
+          await this.page.waitForTimeout(1200);
 
-         console.log("Portal URL after login:", this.page.url());
-console.log(
-  "Password field still visible:",
-  await this.page.locator(passSelector).count()
-);
+          const stillHasPassword =
+            (await this.page.locator(passSelector).count()) > 0;
+
+          if (stillHasPassword) {
+            throw new AppError(
+              502,
+              "PORTAL_LOGIN_NOT_CONFIRMED",
+              "The portal login form is still present after submission. Verify credentials and PORTAL_*_SELECTOR settings."
+            );
+          }
         }
+      } else {
+        const successSelector = process.env.PORTAL_LOGIN_SUCCESS_SELECTOR;
+
+        if (!successSelector) {
+          throw new AppError(
+            503,
+            "PORTAL_LOGIN_FLOW_UNVERIFIED",
+            "Could not find the configured username/password fields. Check the portal login page and configure the PORTAL_*_SELECTOR variables."
+          );
+        }
+
+        await this.page.locator(successSelector).waitFor({
+          state: "visible",
+          timeout: 15000,
+        });
       }
 
       this.ready = true;
+
+      console.log("Portal login flow completed.");
+      console.log("Portal current URL:", this.page.url());
     } catch (error) {
       await this.close();
 
@@ -285,53 +319,64 @@ console.log(
     }
   }
 
-  
-async requestJson(path) {
-  await this.connect();
+  async requestJson(path) {
+    await this.connect();
 
-  const result = await this.page.evaluate(async (requestPath) => {
-    const response = await fetch(requestPath, {
-      method: "GET",
-      credentials: "include",
-      headers: {
-        Accept: "application/json, text/plain, */*",
-      },
-    });
+    const result = await this.page.evaluate(async (requestPath) => {
+      const response = await fetch(requestPath, {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+        },
+      });
 
-    return {
-      status: response.status,
-      body: await response.text(),
-    };
-  }, path);
+      return {
+        status: response.status,
+        body: await response.text(),
+      };
+    }, path);
 
-  if (result.status < 200 || result.status >= 300) {
-    throw new AppError(
-      502,
-      "PORTAL_UPSTREAM_ERROR",
-      `Portal request failed with HTTP ${result.status}.`,
-      { path, upstreamStatus: result.status }
-    );
+    if (result.status === 401 || result.status === 403) {
+      throw new AppError(
+        502,
+        "PORTAL_AUTHENTICATION_FAILED",
+        `The portal rejected the browser session with HTTP ${result.status}. Verify the login completed and that the account has access.`,
+        { path, upstreamStatus: result.status }
+      );
+    }
+
+    if (result.status < 200 || result.status >= 300) {
+      throw new AppError(
+        502,
+        "PORTAL_UPSTREAM_ERROR",
+        `Portal request failed with HTTP ${result.status}.`,
+        { path, upstreamStatus: result.status }
+      );
+    }
+
+    try {
+      return JSON.parse(result.body);
+    } catch {
+      throw new AppError(
+        502,
+        "PORTAL_INVALID_RESPONSE",
+        "The portal did not return valid JSON.",
+        { path }
+      );
+    }
   }
-
-  try {
-    return JSON.parse(result.body);
-  } catch {
-    throw new AppError(
-      502,
-      "PORTAL_INVALID_RESPONSE",
-      "The portal did not return valid JSON.",
-      { path }
-    );
-  }
-}
-
 
   async getMeters({ page = 1, limit = 50, search = "" } = {}) {
     if (!Number.isInteger(Number(page)) || Number(page) < 1) {
       throw new AppError(400, "INVALID_PAGE", "page must be a positive integer.");
     }
 
-    if (!Number.isInteger(Number(limit)) || Number(limit) < 1 || Number(limit) > 100) {
+    if (
+      !Number.isInteger(Number(limit)) ||
+      Number(limit) < 1 ||
+      Number(limit) > 100
+    ) {
       throw new AppError(
         400,
         "INVALID_LIMIT",
@@ -341,15 +386,15 @@ async requestJson(path) {
 
     const portalPage = Number(page);
     const pageSize = Number(limit);
+
     const path =
-      `/portal/meters/search?q=${encodeURIComponent(search)}&page=${portalPage}`;
+      `/portal/meters/search?q=${encodeURIComponent(search)}` +
+      `&page=${portalPage}`;
 
     const raw = await this.requestJson(path);
     const payload = decodeSvelteKitPayload(raw);
     const rows = unwrapRows(payload).map(normalizeMeter);
 
-    // The portal's search response shape should be verified against a
-    // captured response. Never fabricate records when the shape is unknown.
     if (!rows.length) {
       throw new AppError(
         502,
@@ -381,6 +426,7 @@ async requestJson(path) {
     }
 
     const id = encodeURIComponent(String(meterId).trim());
+
     const path = `/meters/${id}/__data.json?x-sveltekit-invalidated=001`;
 
     const raw = await this.requestJson(path);
@@ -420,7 +466,6 @@ async requestJson(path) {
         };
       }
     } catch (error) {
-      // Meter details remain useful if the optional geo endpoint fails.
       if (error instanceof AppError && error.status === 404) {
         geo = null;
       } else {
@@ -469,6 +514,7 @@ async requestJson(path) {
 
     const id = encodeURIComponent(String(meterId).trim());
     const path = `/portal/meters/${id}/energy`;
+
     const payload = await this.requestJson(path);
     const readings = Array.isArray(payload?.data) ? payload.data : [];
 
